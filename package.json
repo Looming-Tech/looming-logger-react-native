@@ -1,6 +1,6 @@
 {
   "name": "looming-logger-react-native",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Looming Tech React Native Logging SDK - Remote logging for React Native apps. Sends logs to a self-hosted Loki backend with automatic batching, offline persistence, and device info collection.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

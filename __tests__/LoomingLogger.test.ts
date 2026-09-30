@@ -299,4 +299,89 @@ describe('LoomingLogger', () => {
       expect(global.fetch).toHaveBeenCalledTimes(1)
     })
   })
+
+  describe('persistence', () => {
+    const stored = (): LogEntry[] => JSON.parse(mockStore.get(STORAGE_KEY) ?? '[]')
+
+    it('persists a queued entry within a second, before any flush', async () => {
+      await LoomingLogger.init(OPTIONS)
+      LoomingLogger.info('queued')
+
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(stored().map((e) => e.message)).toEqual(['queued'])
+      expect(global.fetch).not.toHaveBeenCalled()
+    })
+
+    it('persists an error immediately, before its flush resolves', async () => {
+      let accept: (r: Response) => void = () => {}
+      global.fetch = jest.fn(
+        () => new Promise<Response>((resolve) => (accept = resolve))
+      ) as unknown as typeof fetch
+      await LoomingLogger.init(OPTIONS)
+
+      LoomingLogger.error('boom')
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(stored().map((e) => e.message)).toEqual(['boom'])
+
+      // Let the flush finish, or afterEach's dispose() waits on it forever.
+      accept(respond(201))
+      await LoomingLogger.flush()
+    })
+
+    it('keeps the in-flight batch persisted until the server accepts it', async () => {
+      let accept: (r: Response) => void = () => {}
+      global.fetch = jest.fn(
+        () => new Promise<Response>((resolve) => (accept = resolve))
+      ) as unknown as typeof fetch
+      await LoomingLogger.init(OPTIONS)
+
+      LoomingLogger.info('in flight')
+      const flushed = LoomingLogger.flush()
+      await LoomingLogger.persist()
+      expect(stored().map((e) => e.message)).toEqual(['in flight'])
+
+      accept(respond(201))
+      await flushed
+
+      expect(mockStore.has(STORAGE_KEY)).toBe(false)
+    })
+
+    it('keeps entries that arrived during a send after it succeeds', async () => {
+      let accept: (r: Response) => void = () => {}
+      global.fetch = jest.fn(
+        () => new Promise<Response>((resolve) => (accept = resolve))
+      ) as unknown as typeof fetch
+      await LoomingLogger.init(OPTIONS)
+
+      LoomingLogger.info('first')
+      const flushed = LoomingLogger.flush()
+      LoomingLogger.info('second')
+      accept(respond(201))
+      await flushed
+
+      expect(stored().map((e) => e.message)).toEqual(['second'])
+
+      // 'second' is still queued: let afterEach's dispose() send it.
+      global.fetch = jest.fn(async () => respond(201)) as unknown as typeof fetch
+    })
+
+    it('replays a persisted queue on the next init', async () => {
+      await LoomingLogger.init(OPTIONS)
+      LoomingLogger.warn('before crash')
+      await LoomingLogger.persist()
+
+      // Simulate process death: drop the instance without dispose() (which
+      // would flush), then start a new one on the same storage.
+      jest.clearAllTimers()
+      ;(LoomingLogger as unknown as { _instance: null })._instance = null
+      global.fetch = jest.fn(async () => respond(201)) as unknown as typeof fetch
+      await LoomingLogger.init(OPTIONS)
+      await LoomingLogger.flush()
+
+      expect(bodyOf(0).logs.map((e) => e.message)).toEqual(['before crash'])
+    })
+  })
 })
