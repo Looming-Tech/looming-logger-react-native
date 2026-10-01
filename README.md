@@ -16,7 +16,7 @@ Port of [looming-logger-flutter](https://github.com/Looming-Tech/looming-logger-
 
 - Automatic device info collection (platform, OS version, model, device ID, etc.)
 - Batched log sending with configurable flush interval (default: 30 seconds)
-- Offline persistence — logs are saved to disk on network failure and retried
+- Crash-safe persistence — the queue is saved to disk on every change (within 1 s for normal levels; at the end of the current tick for errors, once per tick however many there are) and replayed on the next launch, so logs survive a network failure, a crash or an OS kill. Call `LoomingLogger.persist()` when the app may be about to die (e.g. on backgrounding) to write it immediately
 - Immediate flush for error-level logs
 - Configurable queue size, flush interval, and timeouts
 - Written in TypeScript, ships with type definitions
@@ -124,6 +124,16 @@ await LoomingLogger.init({
 
 ```ts
 await LoomingLogger.flush()
+```
+
+### Persist Before the App May Die
+
+Writes every unsent entry — including a batch still in flight — to disk now, so the next launch
+replays it. Worth calling on backgrounding, where iOS can suspend the app before a flush completes:
+
+```ts
+await LoomingLogger.persist()
+void LoomingLogger.flush()
 ```
 
 ### Cleanup

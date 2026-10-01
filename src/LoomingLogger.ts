@@ -23,6 +23,17 @@ const MAX_ENTRY_AGE_MS = 50 * 60 * 1000
 const LOG_PATH = '/api/logs/batch'
 
 /**
+ * The longest a non-error entry sits in memory only. The queue used to reach
+ * storage solely after a failed flush, so anything queued when the process died
+ * — a fatal crash, an OS kill after backgrounding — was lost with it.
+ *
+ * A fixed window, not a resetting debounce: the first entry starts the timer and
+ * every entry logged before it fires rides along, so steady logging still writes
+ * at most once a second and no entry waits longer than this.
+ */
+const PERSIST_DELAY_MS = 1000
+
+/**
  * Remote logging service for sending logs to a self-hosted Loki backend.
  *
  * Features:
@@ -57,6 +68,11 @@ export class LoomingLogger {
   private initialized = false
   /** Guards against the interval and an error-triggered flush overlapping. */
   private flushing: Promise<void> | null = null
+  /** The batch a flush is sending; persisted with the queue until accepted. */
+  private inFlight: LogEntry[] = []
+  private persistTimer: ReturnType<typeof setTimeout> | null = null
+  /** An error-triggered write is already scheduled for the current tick. */
+  private errorPersistQueued = false
 
   private constructor(options: LoomingLoggerOptions) {
     // Trailing slash would produce `//api/logs/batch`.
@@ -144,8 +160,12 @@ export class LoomingLogger {
     }
 
     if (level === 'error') {
+      // Persist first: the flush may never complete if the process is dying.
+      this.persistThisTick()
       // Fire-and-forget: logging must never block the caller.
       void this.flushInstance()
+    } else {
+      this.schedulePersist()
     }
   }
 
@@ -165,6 +185,54 @@ export class LoomingLogger {
     }
   }
 
+  private schedulePersist(): void {
+    if (this.persistTimer !== null) return
+
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null
+      void this.persistInstance()
+    }, PERSIST_DELAY_MS)
+  }
+
+  /**
+   * Persist at the end of the current tick, once however many errors it logs.
+   * Writing on every error serialised and wrote the whole queue — up to
+   * maxQueueSize queued plus a batch in flight — once per error, so a burst of
+   * ten errors in one tick did ten full writes on the JS thread. A microtask
+   * still runs before control returns to the native side, so a crash handler
+   * that logs and then hands off gets the same write it did before.
+   */
+  private persistThisTick(): void {
+    if (this.errorPersistQueued) return
+    this.errorPersistQueued = true
+
+    void Promise.resolve().then(() => {
+      this.errorPersistQueued = false
+      return this.persistInstance()
+    })
+  }
+
+  private stopPersistTimer(): void {
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer)
+      this.persistTimer = null
+    }
+  }
+
+  private async persistInstance(): Promise<void> {
+    this.stopPersistTimer()
+
+    // Snapshot synchronously: a flush may move entries between the two arrays
+    // while the write is pending.
+    const pending = [...this.inFlight, ...this.queue]
+
+    if (pending.length > 0) {
+      await saveQueue(pending)
+    } else {
+      await clearQueue()
+    }
+  }
+
   private dropExpired(entries: LogEntry[]): LogEntry[] {
     const cutoff = new Date(Date.now() - MAX_ENTRY_AGE_MS).toISOString()
     return entries.filter((entry) => !entry.timestamp || entry.timestamp >= cutoff)
@@ -173,6 +241,24 @@ export class LoomingLogger {
   /** Manually flush all pending logs. */
   public static async flush(): Promise<void> {
     await LoomingLogger._instance?.flushInstance()
+  }
+
+  /**
+   * Write everything not yet accepted by the server to storage now. Call when
+   * the process may be about to die — on backgrounding, or from a fatal error
+   * handler — so the next launch replays it.
+   */
+  public static async persist(): Promise<void> {
+    const instance = LoomingLogger._instance
+
+    // Not while init() is still running: _instance is assigned before the
+    // persisted queue is loaded, so the in-memory queue is still empty and
+    // writing it would clear the very copy init() is about to read. The guard
+    // is here, not in persistInstance(), because dispose() clears `initialized`
+    // before its final flush and that flush must still persist what it leaves.
+    if (!instance?.initialized) return
+
+    await instance.persistInstance()
   }
 
   private flushInstance(): Promise<void> {
@@ -195,14 +281,16 @@ export class LoomingLogger {
 
     const batch = this.queue
     this.queue = []
+    this.inFlight = batch
 
     try {
       const response = await this.post(batch)
+      this.inFlight = []
 
       if (response.status >= 400 && response.status < 500) {
         // 4xx is a permanent rejection — re-queueing would loop forever.
-        // Drop the batch, and drop any persisted copy of it too.
-        await clearQueue()
+        // Drop the batch; keep only what arrived since.
+        await this.persistInstance()
         return
       }
 
@@ -213,11 +301,12 @@ export class LoomingLogger {
         return
       }
 
-      // Sent. Clear the persisted copy so an earlier outage's queue is not
-      // replayed on next launch.
-      await clearQueue()
+      // Sent. Persist only what arrived during the send, so the accepted batch
+      // (and an earlier outage's queue) is not replayed on the next launch.
+      await this.persistInstance()
     } catch {
       // Network error — retry on next flush.
+      this.inFlight = []
       this.queue.unshift(...batch)
       await saveQueue(this.queue)
     }
@@ -255,6 +344,7 @@ export class LoomingLogger {
 
   private async disposeInstance(): Promise<void> {
     this.stopFlushTimer()
+    this.stopPersistTimer()
     this.initialized = false
     await this.flushInstance()
 

@@ -49,6 +49,19 @@ const respond = (status: number) => ({ status }) as Response
 const bodyOf = (call: number): { logs: LogEntry[] } =>
   JSON.parse((global.fetch as jest.Mock).mock.calls[call][1].body)
 
+/**
+ * A fresh copy of the SDK on the same storage — what the next process launch
+ * sees. Simulates death without reaching into private state: the previous copy
+ * is simply never used again (callers clear its timers first).
+ */
+const nextLaunch = (): typeof LoomingLogger => {
+  let fresh!: typeof LoomingLogger
+  jest.isolateModules(() => {
+    fresh = require('../src').LoomingLogger
+  })
+  return fresh
+}
+
 describe('LoomingLogger', () => {
   beforeEach(async () => {
     mockStore.clear()
@@ -297,6 +310,194 @@ describe('LoomingLogger', () => {
       await Promise.resolve()
 
       expect(global.fetch).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('persistence', () => {
+    const stored = (): LogEntry[] => JSON.parse(mockStore.get(STORAGE_KEY) ?? '[]')
+
+    it('persists a queued entry within a second, before any flush', async () => {
+      await LoomingLogger.init(OPTIONS)
+      LoomingLogger.info('queued')
+
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(stored().map((e) => e.message)).toEqual(['queued'])
+      expect(global.fetch).not.toHaveBeenCalled()
+    })
+
+    it('persists an error immediately, before its flush resolves', async () => {
+      let accept: (r: Response) => void = () => {}
+      global.fetch = jest.fn(
+        () => new Promise<Response>((resolve) => (accept = resolve))
+      ) as unknown as typeof fetch
+      await LoomingLogger.init(OPTIONS)
+
+      LoomingLogger.error('boom')
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(stored().map((e) => e.message)).toEqual(['boom'])
+
+      // Let the flush finish, or afterEach's dispose() waits on it forever.
+      accept(respond(201))
+      await LoomingLogger.flush()
+    })
+
+    it('keeps the in-flight batch persisted until the server accepts it', async () => {
+      let accept: (r: Response) => void = () => {}
+      global.fetch = jest.fn(
+        () => new Promise<Response>((resolve) => (accept = resolve))
+      ) as unknown as typeof fetch
+      await LoomingLogger.init(OPTIONS)
+
+      LoomingLogger.info('in flight')
+      const flushed = LoomingLogger.flush()
+      await LoomingLogger.persist()
+      expect(stored().map((e) => e.message)).toEqual(['in flight'])
+
+      accept(respond(201))
+      await flushed
+
+      expect(mockStore.has(STORAGE_KEY)).toBe(false)
+    })
+
+    it('keeps entries that arrived during a send after it succeeds', async () => {
+      let accept: (r: Response) => void = () => {}
+      global.fetch = jest.fn(
+        () => new Promise<Response>((resolve) => (accept = resolve))
+      ) as unknown as typeof fetch
+      await LoomingLogger.init(OPTIONS)
+
+      LoomingLogger.info('first')
+      const flushed = LoomingLogger.flush()
+      LoomingLogger.info('second')
+      accept(respond(201))
+      await flushed
+
+      expect(stored().map((e) => e.message)).toEqual(['second'])
+
+      // 'second' is still queued: let afterEach's dispose() send it.
+      global.fetch = jest.fn(async () => respond(201)) as unknown as typeof fetch
+    })
+
+    it('keeps recovered entries on disk after init, until they are sent', async () => {
+      mockStore.set(
+        STORAGE_KEY,
+        JSON.stringify([
+          { level: 'warn', message: 'from the crashed run', timestamp: new Date().toISOString() },
+        ])
+      )
+
+      await LoomingLogger.init(OPTIONS)
+      // Nothing new is logged and the 30 s flush has not run yet.
+      await jest.advanceTimersByTimeAsync(5000)
+
+      expect(stored().map((e) => e.message)).toEqual(['from the crashed run'])
+
+      await LoomingLogger.flush()
+      expect(mockStore.has(STORAGE_KEY)).toBe(false)
+    })
+
+    it('still delivers the first run logs when the relaunch dies too', async () => {
+      // A startup crash loop: run 1 left entries on disk, run 2 loads them and
+      // dies before any save or send, run 3 must still have them.
+      mockStore.set(
+        STORAGE_KEY,
+        JSON.stringify([
+          { level: 'warn', message: 'from run 1', timestamp: new Date().toISOString() },
+        ])
+      )
+      global.fetch = jest.fn(() => new Promise(() => {})) as unknown as typeof fetch
+
+      await LoomingLogger.init(OPTIONS) // run 2
+      await jest.advanceTimersByTimeAsync(500)
+      jest.clearAllTimers() // run 2 dies
+
+      global.fetch = jest.fn(async () => respond(201)) as unknown as typeof fetch
+      const run3 = nextLaunch()
+      await run3.init(OPTIONS)
+      await run3.flush()
+
+      expect(bodyOf(0).logs.map((e) => e.message)).toEqual(['from run 1'])
+      await run3.dispose()
+    })
+
+    it('replays a persisted queue on the next init', async () => {
+      await LoomingLogger.init(OPTIONS)
+      LoomingLogger.warn('before crash')
+      await LoomingLogger.persist()
+
+      // Simulate process death without dispose() (which would flush): stop the
+      // old copy's timers, then start a fresh copy on the same storage.
+      jest.clearAllTimers()
+      global.fetch = jest.fn(async () => respond(201)) as unknown as typeof fetch
+      const relaunched = nextLaunch()
+      await relaunched.init(OPTIONS)
+      await relaunched.flush()
+
+      expect(bodyOf(0).logs.map((e) => e.message)).toEqual(['before crash'])
+      await relaunched.dispose()
+    })
+
+    it('persist() while init() is still running does not wipe the queue it loads', async () => {
+      mockStore.set(
+        STORAGE_KEY,
+        JSON.stringify([
+          { level: 'warn', message: 'saved before', timestamp: new Date().toISOString() },
+        ])
+      )
+
+      // init() is still collecting device info when persist() runs.
+      const initialising = LoomingLogger.init(OPTIONS)
+      await LoomingLogger.persist()
+      await initialising
+      await LoomingLogger.flush()
+
+      expect(bodyOf(0).logs.map((e) => e.message)).toEqual(['saved before'])
+    })
+
+    it('coalesces a burst of errors in one tick into a single write', async () => {
+      const storage = jest.requireMock('@react-native-async-storage/async-storage').default
+      let accept: (r: Response) => void = () => {}
+      global.fetch = jest.fn(
+        () => new Promise<Response>((resolve) => (accept = resolve))
+      ) as unknown as typeof fetch
+      await LoomingLogger.init(OPTIONS)
+      storage.setItem.mockClear()
+
+      for (let index = 0; index < 10; index += 1) LoomingLogger.error(`boom ${index}`)
+      await Promise.resolve()
+      await Promise.resolve()
+
+      const queueWrites = storage.setItem.mock.calls.filter(([key]: [string]) => key === STORAGE_KEY)
+      expect(queueWrites).toHaveLength(1)
+      expect(stored()).toHaveLength(10)
+
+      // Only 'boom 0' was in flight; the other nine are still queued, so let the
+      // remaining sends resolve or afterEach's dispose() waits on them forever.
+      accept(respond(201))
+      global.fetch = jest.fn(async () => respond(201)) as unknown as typeof fetch
+      await LoomingLogger.flush()
+    })
+
+    it('keeps entries that arrived during a rejected (4xx) send', async () => {
+      let reject4xx: (r: Response) => void = () => {}
+      global.fetch = jest.fn(
+        () => new Promise<Response>((resolve) => (reject4xx = resolve))
+      ) as unknown as typeof fetch
+      await LoomingLogger.init(OPTIONS)
+
+      LoomingLogger.info('rejected')
+      const flushed = LoomingLogger.flush()
+      LoomingLogger.info('arrived during the send')
+      reject4xx(respond(400))
+      await flushed
+
+      expect(stored().map((e) => e.message)).toEqual(['arrived during the send'])
+
+      // 'arrived during the send' is still queued: let afterEach's dispose() send it.
+      global.fetch = jest.fn(async () => respond(201)) as unknown as typeof fetch
     })
   })
 })
