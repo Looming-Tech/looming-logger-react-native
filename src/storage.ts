@@ -18,15 +18,19 @@ export async function saveQueue(queue: LogEntry[]): Promise<void> {
 }
 
 /**
- * Read and clear the persisted queue. Returns [] if nothing is stored or the
- * payload is unreadable.
+ * Read the persisted queue. Returns [] if nothing is stored or the payload is
+ * unreadable.
+ *
+ * Deliberately does not clear it. The entries are being replayed, not
+ * delivered: until a send succeeds they exist only in memory, so a process that
+ * dies again before then — a startup crash loop — would lose the previous run's
+ * logs for good. The copy is replaced by the next persist, and cleared once a
+ * send is accepted.
  */
 export async function loadQueue(): Promise<LogEntry[]> {
   try {
     const stored = await AsyncStorage.getItem(STORAGE_KEY)
     if (!stored) return []
-
-    await AsyncStorage.removeItem(STORAGE_KEY)
 
     const parsed: unknown = JSON.parse(stored)
     return Array.isArray(parsed) ? (parsed as LogEntry[]) : []

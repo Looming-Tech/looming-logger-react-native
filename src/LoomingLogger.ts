@@ -23,11 +23,15 @@ const MAX_ENTRY_AGE_MS = 50 * 60 * 1000
 const LOG_PATH = '/api/logs/batch'
 
 /**
- * How long a non-error entry may sit in memory only. The queue used to reach
+ * The longest a non-error entry sits in memory only. The queue used to reach
  * storage solely after a failed flush, so anything queued when the process died
  * — a fatal crash, an OS kill after backgrounding — was lost with it.
+ *
+ * A fixed window, not a resetting debounce: the first entry starts the timer and
+ * every entry logged before it fires rides along, so steady logging still writes
+ * at most once a second and no entry waits longer than this.
  */
-const PERSIST_DEBOUNCE_MS = 1000
+const PERSIST_DELAY_MS = 1000
 
 /**
  * Remote logging service for sending logs to a self-hosted Loki backend.
@@ -67,6 +71,8 @@ export class LoomingLogger {
   /** The batch a flush is sending; persisted with the queue until accepted. */
   private inFlight: LogEntry[] = []
   private persistTimer: ReturnType<typeof setTimeout> | null = null
+  /** An error-triggered write is already scheduled for the current tick. */
+  private errorPersistQueued = false
 
   private constructor(options: LoomingLoggerOptions) {
     // Trailing slash would produce `//api/logs/batch`.
@@ -155,7 +161,7 @@ export class LoomingLogger {
 
     if (level === 'error') {
       // Persist first: the flush may never complete if the process is dying.
-      void this.persistInstance()
+      this.persistThisTick()
       // Fire-and-forget: logging must never block the caller.
       void this.flushInstance()
     } else {
@@ -185,7 +191,25 @@ export class LoomingLogger {
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null
       void this.persistInstance()
-    }, PERSIST_DEBOUNCE_MS)
+    }, PERSIST_DELAY_MS)
+  }
+
+  /**
+   * Persist at the end of the current tick, once however many errors it logs.
+   * Writing on every error serialised and wrote the whole queue — up to
+   * maxQueueSize queued plus a batch in flight — once per error, so a burst of
+   * ten errors in one tick did ten full writes on the JS thread. A microtask
+   * still runs before control returns to the native side, so a crash handler
+   * that logs and then hands off gets the same write it did before.
+   */
+  private persistThisTick(): void {
+    if (this.errorPersistQueued) return
+    this.errorPersistQueued = true
+
+    void Promise.resolve().then(() => {
+      this.errorPersistQueued = false
+      return this.persistInstance()
+    })
   }
 
   private stopPersistTimer(): void {
@@ -225,7 +249,16 @@ export class LoomingLogger {
    * handler — so the next launch replays it.
    */
   public static async persist(): Promise<void> {
-    await LoomingLogger._instance?.persistInstance()
+    const instance = LoomingLogger._instance
+
+    // Not while init() is still running: _instance is assigned before the
+    // persisted queue is loaded, so the in-memory queue is still empty and
+    // writing it would clear the very copy init() is about to read. The guard
+    // is here, not in persistInstance(), because dispose() clears `initialized`
+    // before its final flush and that flush must still persist what it leaves.
+    if (!instance?.initialized) return
+
+    await instance.persistInstance()
   }
 
   private flushInstance(): Promise<void> {

@@ -16,7 +16,7 @@ Port of [looming-logger-flutter](https://github.com/Looming-Tech/looming-logger-
 
 - Automatic device info collection (platform, OS version, model, device ID, etc.)
 - Batched log sending with configurable flush interval (default: 30 seconds)
-- Crash-safe persistence — the queue is saved to disk on every change (debounced 1 s, immediate for errors) and replayed on the next launch, so logs survive a network failure, a crash or an OS kill. Call `LoomingLogger.persist()` when the app may be about to die (e.g. on backgrounding) to write it immediately
+- Crash-safe persistence — the queue is saved to disk on every change (within 1 s for normal levels; at the end of the current tick for errors, once per tick however many there are) and replayed on the next launch, so logs survive a network failure, a crash or an OS kill. Call `LoomingLogger.persist()` when the app may be about to die (e.g. on backgrounding) to write it immediately
 - Immediate flush for error-level logs
 - Configurable queue size, flush interval, and timeouts
 - Written in TypeScript, ships with type definitions
